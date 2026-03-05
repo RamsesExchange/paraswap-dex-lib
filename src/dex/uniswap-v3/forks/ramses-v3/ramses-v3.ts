@@ -1,23 +1,132 @@
-import { UniswapV3 } from '../../uniswap-v3';
 import { Network } from '../../../../constants';
-import { IDexHelper } from '../../../../dex-helper';
-import { Adapters, UniswapV3Config } from '../../config';
+import { UniswapV3Config } from '../../config';
 import { getDexKeysWithNetwork } from '../../../../utils';
 import _ from 'lodash';
+import { VelodromeSlipstream } from '../velodrome-slipstream/velodrome-slipstream';
 import { Address } from '../../../../types';
 import { PoolLiquidity } from '../../../../types';
+import { MultiCallParams } from '../../../../lib/multi-wrapper';
+import { uint24ToBigInt } from '../../../../lib/decoders';
+import { Interface } from '@ethersproject/abi';
+import RamsesV3PoolABI from '../../../../abi/ramses-v3/RamsesV3Pool.abi.json';
+import { VelodromeSlipstreamEventPool } from '../velodrome-slipstream/velodrome-slipstream-pool';
+import {
+  UNISWAPV3_CLEAN_NOT_EXISTING_POOL_TTL_MS,
+  UNISWAPV3_CLEAN_NOT_EXISTING_POOL_INTERVAL_MS,
+} from '../../uniswap-v3';
 
-export class RamsesV3 extends UniswapV3 {
+export class RamsesV3 extends VelodromeSlipstream {
   public static dexKeysWithNetwork: { key: string; networks: Network[] }[] =
     getDexKeysWithNetwork(_.pick(UniswapV3Config, ['RamsesV3']));
 
-  constructor(
-    protected network: Network,
-    dexKey: string,
-    protected dexHelper: IDexHelper,
-    protected adapters = Adapters[network] || {},
-  ) {
-    super(network, dexKey, dexHelper, adapters);
+  protected readonly poolIface = new Interface(RamsesV3PoolABI);
+
+  private static readonly FEE_REFRESH_INTERVAL_MS = 60 * 1000;
+  protected feeUpdateIntervalTask?: NodeJS.Timeout;
+
+  async initializePricing(blockNumber: number) {
+    await this.factory.initialize(blockNumber);
+
+    if (!this.dexHelper.config.isSlave) {
+      const cleanExpiredNotExistingPoolsKeys = async () => {
+        const maxTimestamp =
+          Date.now() - UNISWAPV3_CLEAN_NOT_EXISTING_POOL_TTL_MS;
+        await this.dexHelper.cache.zremrangebyscore(
+          this.notExistingPoolSetKey,
+          0,
+          maxTimestamp,
+        );
+      };
+
+      void cleanExpiredNotExistingPoolsKeys();
+
+      this.intervalTask = setInterval(
+        cleanExpiredNotExistingPoolsKeys.bind(this),
+        UNISWAPV3_CLEAN_NOT_EXISTING_POOL_INTERVAL_MS,
+      );
+    } else {
+      void this.updateAllPoolFees();
+
+      this.feeUpdateIntervalTask = setInterval(
+        this.updateAllPoolFees.bind(this),
+        RamsesV3.FEE_REFRESH_INTERVAL_MS,
+      );
+    }
+  }
+
+  protected buildFeeCallData(
+    pools: VelodromeSlipstreamEventPool[],
+  ): MultiCallParams<bigint>[] {
+    return pools.map(pool => ({
+      target: pool.poolAddress,
+      callData: this.poolIface.encodeFunctionData('fee', []),
+      decodeFunction: uint24ToBigInt,
+    }));
+  }
+
+  protected async updateAllPoolFees(): Promise<void> {
+    try {
+      const activePools = Object.values(this.eventPools).filter(
+        pool => pool !== null,
+      ) as VelodromeSlipstreamEventPool[];
+
+      if (activePools.length === 0) {
+        this.logger.warn(`${this.dexKey}: No active pools to update fees for`);
+        return;
+      }
+
+      this.logger.info(
+        `${this.dexKey}: Updating fees for ${activePools.length} pools`,
+      );
+
+      const callData = this.buildFeeCallData(activePools);
+
+      const results = await this.dexHelper.multiWrapper.tryAggregate<bigint>(
+        false,
+        callData,
+      );
+
+      const updateBlockNumber = await this.dexHelper.provider.getBlockNumber();
+
+      activePools.forEach((pool, index) => {
+        if (!results[index].success) {
+          this.logger.warn(
+            `${this.dexKey}: Failed to fetch fee for pool ${pool.poolAddress}`,
+          );
+          return;
+        }
+
+        const newFee = results[index].returnData;
+        const currentState = pool.getStaleState();
+
+        if (!currentState) {
+          this.logger.debug(
+            `${this.dexKey}: No state available for pool ${pool.poolAddress}, skipping fee update`,
+          );
+          return;
+        }
+
+        if (currentState.fee !== newFee) {
+          const newState = { ...currentState, fee: newFee };
+          pool.setState(newState, updateBlockNumber);
+
+          this.logger.debug(
+            `${this.dexKey}: Updated fee for pool ${pool.poolAddress}: ${currentState.fee} -> ${newFee}`,
+          );
+        }
+      });
+    } catch (error) {
+      this.logger.error(`${this.dexKey}: Error updating pool fees:`, error);
+    }
+  }
+
+  releaseResources() {
+    super.releaseResources();
+
+    if (this.feeUpdateIntervalTask !== undefined) {
+      clearInterval(this.feeUpdateIntervalTask);
+      this.feeUpdateIntervalTask = undefined;
+    }
   }
 
   async getTopPoolsForToken(
